@@ -1,0 +1,67 @@
+{
+  "project_name": "ESP32 Indoor Positioning System",
+  "version": "1.0.0",
+  "anchors": [
+    {
+      "id": "A",
+      "ssid": "INDOOR_ANCHOR_A",
+      "coordinates": [0.0, 0.0],
+      "enabled": true,
+      "description": "Fixed Wi-Fi Anchor A (Origin)"
+    },
+    {
+      "id": "B",
+      "ssid": "INDOOR_ANCHOR_B",
+      "coordinates": [10.0, 0.0],
+      "enabled": true,
+      "description": "Fixed Wi-Fi Anchor B (10m baseline on X axis)"
+    }
+  ],
+  "serial": {
+    "port": "COM3",
+    "baud_rate": 115200,
+    "timeout_sec": 1.0,
+    "auto_reconnect": true,
+    "reconnect_interval_sec": 2.0,
+    "simulation_fallback": true
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "cors_allowed": true
+  },
+  "estimator": {
+    "mode": "adaptive_kalman",
+    "d0_meters": 1.0,
+    "rssi_0_dbm": -45.0,
+    "path_loss_exponent": 2.4,
+    "rssi_min_valid_dbm": -95.0,
+    "rssi_sentinel_dbm": -127.0,
+    "stale_timeout_ms": 2500,
+    "filter_type": "median_ema",
+    "ema_alpha": 0.35,
+    "median_window_size": 5,
+    "dt": 0.1,
+    "line_constraint_y": 0.0,
+    "kalman": {
+      "q_pos": 0.02,
+      "q_vel": 0.15,
+      "r_base": 3.0,
+      "adaptive_scaling": true,
+      "adaptive_spread_threshold": 4.5,
+      "high_noise_multiplier": 5.0
+    },
+    "imu": {
+      "accel_bias_x": 0.0,
+      "accel_bias_y": 0.0,
+      "zupt_threshold_mps2": 0.25,
+      "gravity_mps2": 9.80665
+    }
+  },
+  "storage": {
+    "db_path": "indoor_positioning.db",
+    "max_records": 50000,
+    "enable_raw_logging": true,
+    "enable_event_logging": true
+  }
+}

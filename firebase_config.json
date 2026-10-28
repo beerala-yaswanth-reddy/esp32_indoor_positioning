@@ -1,0 +1,49 @@
+{
+  "project_name": "ESP32 Indoor Positioning Firebase System",
+  "version": "1.0.0",
+  "firebase": {
+    "database_url": "https://tracker-467eb-default-rtdb.asia-southeast1.firebasedatabase.app/",
+    "auth_secret": "",
+    "device_id": "tracker_01",
+    "live_path": "current_location",
+    "history_path": "location_history",
+    "enable_history_logging": true,
+    "send_rate_hz": 2.0
+  },
+  "serial": {
+    "port": "AUTO",
+    "baud_rate": 115200,
+    "timeout_sec": 1.0,
+    "reconnect_interval_sec": 2.0,
+    "simulation_fallback": true
+  },
+  "anchors": [
+    {
+      "id": "A",
+      "ssid": "INDOOR_ANCHOR_A",
+      "coords": [0.0, 0.0],
+      "description": "Fixed Anchor A (Origin)"
+    },
+    {
+      "id": "B",
+      "ssid": "INDOOR_ANCHOR_B",
+      "coords": [10.0, 0.0],
+      "description": "Fixed Anchor B (10m baseline)"
+    }
+  ],
+  "estimator": {
+    "d0_meters": 1.0,
+    "rssi_0_dbm": -45.0,
+    "path_loss_exponent": 2.4,
+    "stale_timeout_sec": 2.5,
+    "dt": 0.1,
+    "zupt_threshold_mps2": 0.25,
+    "kalman": {
+      "q_pos": 0.02,
+      "q_vel": 0.15,
+      "r_base": 3.0,
+      "adaptive_spread_threshold": 4.5,
+      "high_noise_multiplier": 5.0
+    }
+  }
+}
