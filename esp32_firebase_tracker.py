@@ -6,7 +6,10 @@ A self-contained script that:
 2. Parses 10 Hz NDJSON telemetry (IMU + Wi-Fi RSSI from Anchors A & B).
 3. Computes 2D/1D real-time position using an Adaptive Kalman Filter,
    path-loss distance estimation, and Zero Velocity Update (ZUPT).
-4. Streams the live location and historical trajectory to Firebase Database
+4. Employs Acuity-based Motion Detection (Acceleration Variance) and
+   Position Deadband Clamping so that when the tracker is idle, it stays
+   rock-solid at rest (0.0 m/s, status: STATIONARY).
+5. Streams the live location and historical trajectory to Firebase Database
    (Firebase Realtime Database REST API or Firebase Firestore).
 """
 
@@ -63,7 +66,8 @@ DEFAULT_CONFIG = {
         "path_loss_exponent": 2.4,
         "stale_timeout_sec": 2.5,
         "dt": 0.1,
-        "zupt_threshold_mps2": 0.25,
+        "motion_threshold_mps2": 0.08,   # Std-dev of acceleration magnitude indicating movement
+        "position_deadband_m": 0.65,     # Deadband radius to prevent RF jitter drift while stationary
         "kalman": {
             "q_pos": 0.02,
             "q_vel": 0.15,
@@ -79,22 +83,34 @@ DEFAULT_CONFIG = {
 # NOISE FILTERING & POSITION ESTIMATION
 # ==============================================================================
 class RSSIFilter:
-    """Sliding-window median + EMA filter for raw Wi-Fi RSSI samples."""
+    """Sliding-window median + EMA filter with step limiter and micro-deadband."""
 
-    def __init__(self, window_size: int = 5, ema_alpha: float = 0.35):
+    def __init__(self, window_size: int = 7, ema_alpha: float = 0.25):
         self.history: deque = deque(maxlen=window_size)
         self.alpha = ema_alpha
         self.ema_value: Optional[float] = None
         self.last_update_time: float = 0.0
 
     def update(self, raw_rssi: float, current_time: float) -> float:
+        # Rejection of abrupt multipath spikes (> 8 dBm in a single 100ms frame)
+        if self.ema_value is not None:
+            delta = raw_rssi - self.ema_value
+            if abs(delta) > 8.0:
+                raw_rssi = self.ema_value + math.copysign(8.0, delta)
+
         self.history.append(raw_rssi)
         self.last_update_time = current_time
+
+        # Step 1: Median over sliding window to reject RF multipath glitches
         median_val = float(np.median(list(self.history)))
+
+        # Step 2: Exponential moving average with deadband to avoid endless micro-jitter
         if self.ema_value is None:
             self.ema_value = median_val
         else:
-            self.ema_value = self.alpha * median_val + (1.0 - self.alpha) * self.ema_value
+            if abs(median_val - self.ema_value) >= 0.7:  # Deadband: ignore micro-noise < 0.7 dBm
+                self.ema_value = self.alpha * median_val + (1.0 - self.alpha) * self.ema_value
+
         return self.ema_value
 
     def is_stale(self, current_time: float, timeout_sec: float) -> bool:
@@ -105,6 +121,7 @@ class AdaptiveKalmanPositionEstimator:
     """
     Self-contained 4-State Adaptive Kalman Filter fusing Wi-Fi RSSI
     trilateration with MPU6050 accelerometer & Zero Velocity Updates (ZUPT).
+    Includes Acuity-based Motion Detection and Stationary Position Clamping.
     State: [x, y, vx, vy]
     """
 
@@ -116,7 +133,8 @@ class AdaptiveKalmanPositionEstimator:
         self.ple = float(est_cfg.get("path_loss_exponent", 2.4))
         self.stale_timeout = float(est_cfg.get("stale_timeout_sec", 2.5))
         self.dt = float(est_cfg.get("dt", 0.1))
-        self.zupt_threshold = float(est_cfg.get("zupt_threshold_mps2", 0.25))
+        self.motion_threshold = float(est_cfg.get("motion_threshold_mps2", 0.08))
+        self.position_deadband_m = float(est_cfg.get("position_deadband_m", 0.65))
 
         # Anchor coordinates
         self.anchors = {
@@ -156,12 +174,30 @@ class AdaptiveKalmanPositionEstimator:
         self.spread_threshold = float(kf_cfg.get("adaptive_spread_threshold", 4.5))
         self.high_noise_mult = float(kf_cfg.get("high_noise_multiplier", 5.0))
 
-        # Internal State
+        # Internal Filter States
         self.state = np.array([0.0, 0.0, 0.0, 0.0], dtype=float)
         self.P = np.diag([1.0, 1.0, 0.5, 0.5])
         self.heading_rad: float = 0.0
         self.has_first_fix: bool = False
         self.last_predict_time: float = time.time()
+
+        # Dynamic Startup IMU Bias Calibration
+        self.calibrating = True
+        self.calib_samples_target = 30
+        self.calib_buffer_ax: List[float] = []
+        self.calib_buffer_ay: List[float] = []
+        self.calib_buffer_gz: List[float] = []
+        self.bias_ax = 0.0
+        self.bias_ay = 0.0
+        self.bias_gz = 0.0
+
+        # Motion & Stationary State Detection
+        self.accel_history: deque = deque(maxlen=15)
+        self.is_stationary = True
+        self.stationary_streak = 5
+        self.moving_streak = 0
+        self.locked_position: Optional[Tuple[float, float]] = None
+        self.accel_variance = 0.0
 
     def rssi_to_distance(self, rssi_dbm: float) -> float:
         """Log-distance path-loss model: d = d0 * 10 ^ ((RSSI_0 - RSSI) / (10 * PLE))"""
@@ -225,19 +261,61 @@ class AdaptiveKalmanPositionEstimator:
         dt = max(0.01, min(now - self.last_predict_time, 1.0))
         self.last_predict_time = now
 
-        # 1. Parse IMU
+        # 1. Parse IMU & Perform Calibration
         imu = telemetry.get("imu", {})
         accel = imu.get("accel_mps2", {})
         gyro = imu.get("gyro_rads", {})
 
-        ax = float(accel.get("x", 0.0))
-        ay = float(accel.get("y", 0.0))
-        gz = float(gyro.get("z", 0.0))
+        raw_ax = float(accel.get("x", 0.0))
+        raw_ay = float(accel.get("y", 0.0))
+        raw_gz = float(gyro.get("z", 0.0))
 
-        # Integrate heading from Z-gyroscope
+        # Handle automatic startup calibration
+        if self.calibrating:
+            self.calib_buffer_ax.append(raw_ax)
+            self.calib_buffer_ay.append(raw_ay)
+            self.calib_buffer_gz.append(raw_gz)
+            if len(self.calib_buffer_ax) >= self.calib_samples_target:
+                self.bias_ax = float(np.mean(self.calib_buffer_ax))
+                self.bias_ay = float(np.mean(self.calib_buffer_ay))
+                self.bias_gz = float(np.mean(self.calib_buffer_gz))
+                self.calibrating = False
+
+        # Subtract baseline zero-bias offsets
+        ax = raw_ax - self.bias_ax
+        ay = raw_ay - self.bias_ay
+        gz = raw_gz - self.bias_gz
+
+        # 2. Acuity-Based Motion Detection (Variance of Acceleration Magnitude)
+        accel_mag = math.sqrt(ax**2 + ay**2)
+        self.accel_history.append(accel_mag)
+
+        if len(self.accel_history) >= 8:
+            self.accel_variance = float(np.std(list(self.accel_history)))
+            accel_mean = float(np.mean(list(self.accel_history)))
+        else:
+            self.accel_variance = 0.0
+            accel_mean = accel_mag
+
+        # Stationary condition: acceleration variance is minimal (resting on surface)
+        instant_stationary = (self.accel_variance < self.motion_threshold) and (accel_mean < 0.25)
+        if instant_stationary:
+            self.stationary_streak += 1
+            self.moving_streak = 0
+            if self.stationary_streak >= 4:
+                self.is_stationary = True
+        else:
+            self.moving_streak += 1
+            if self.moving_streak >= 3:
+                self.is_stationary = False
+                self.stationary_streak = 0
+
+        # Gyroscope integration (suppress heading drift when stationary)
+        if self.is_stationary or abs(gz) < 0.02:
+            gz = 0.0
         self.heading_rad = (self.heading_rad + gz * dt) % (2.0 * math.pi)
 
-        # 2. Filter RSSI & calculate distances
+        # 3. Filter Wi-Fi RSSI & calculate distances
         distances = {}
         raw_rssis = []
         for a_info in telemetry.get("anchors", []):
@@ -250,19 +328,23 @@ class AdaptiveKalmanPositionEstimator:
                 raw_rssis.append(filt_rssi)
                 distances[aid] = self.rssi_to_distance(filt_rssi)
 
-        # 3. Kalman Prediction Step
-        u = np.array([ax, ay], dtype=float)
-        # ZUPT: If acceleration magnitude is near zero, damp velocity drift
-        accel_mag = math.sqrt(ax**2 + ay**2)
-        if accel_mag < self.zupt_threshold:
-            self.state[2] *= 0.5  # vx damped
-            self.state[3] *= 0.5  # vy damped
+        # 4. Kalman Prediction Step
+        if self.is_stationary:
+            # Force velocity to 0 and remove acceleration input when stationary
+            self.state[2] = 0.0
+            self.state[3] = 0.0
             u = np.zeros(2, dtype=float)
+            # Continuous gentle background bias trimming
+            self.bias_ax = 0.995 * self.bias_ax + 0.005 * raw_ax
+            self.bias_ay = 0.995 * self.bias_ay + 0.005 * raw_ay
+            self.bias_gz = 0.995 * self.bias_gz + 0.005 * raw_gz
+        else:
+            u = np.array([ax, ay], dtype=float)
 
         x_pred = self.F @ self.state + self.B @ u
         P_pred = self.F @ self.P @ self.F.T + self.Q
 
-        # 4. Kalman Measurement Update Step
+        # 5. Kalman Measurement Update Step
         geom_pos = self.solve_geometric_position(distances)
         measurement_valid = False
 
@@ -272,11 +354,33 @@ class AdaptiveKalmanPositionEstimator:
             if not self.has_first_fix:
                 self.state[0] = z[0]
                 self.state[1] = z[1]
+                self.locked_position = (float(z[0]), float(z[1]))
                 self.has_first_fix = True
                 x_pred[:2] = z
 
+            # Deadband Clamping: If stationary, lock position against RF noise
+            if self.is_stationary and self.locked_position is not None:
+                dist_from_locked = math.sqrt(
+                    (z[0] - self.locked_position[0])**2 +
+                    (z[1] - self.locked_position[1])**2
+                )
+                if dist_from_locked < self.position_deadband_m:
+                    # Within deadband: keep position locked to resting coordinates
+                    z = np.array(self.locked_position, dtype=float)
+                else:
+                    # Sustained displacement: gently adapt locked position
+                    self.locked_position = (
+                        0.9 * self.locked_position[0] + 0.1 * z[0],
+                        0.9 * self.locked_position[1] + 0.1 * z[1]
+                    )
+            else:
+                self.locked_position = (float(z[0]), float(z[1]))
+
             # Adaptive Measurement Noise Scaling
             R = self.R_nominal.copy()
+            if self.is_stationary:
+                R *= 4.0  # Strongly de-prioritize noisy Wi-Fi fluctuations while stationary
+
             if len(raw_rssis) >= 2:
                 spread = float(np.std(raw_rssis))
                 if spread > self.spread_threshold:
@@ -294,16 +398,24 @@ class AdaptiveKalmanPositionEstimator:
             self.state = x_pred
             self.P = P_pred
 
-        # 5. Build Result Payload
+        # Enforce strict stationary clamping
+        if self.is_stationary:
+            self.state[2] = 0.0
+            self.state[3] = 0.0
+            if self.locked_position is not None:
+                self.state[0] = self.locked_position[0]
+                self.state[1] = self.locked_position[1]
+
+        # 6. Build Result Payload
         pos_x = float(self.state[0])
         pos_y = float(self.state[1])
-        vx = float(self.state[2])
-        vy = float(self.state[3])
-        speed = float(math.sqrt(vx**2 + vy**2))
+        vx = 0.0 if self.is_stationary else float(self.state[2])
+        vy = 0.0 if self.is_stationary else float(self.state[3])
+        speed = 0.0 if self.is_stationary else float(math.sqrt(vx**2 + vy**2))
         heading_deg = float(math.degrees(self.heading_rad) % 360.0)
         uncertainty = float(math.sqrt(max(0.01, self.P[0, 0] + self.P[1, 1])))
 
-        status_str = "TRACKING_ACTIVE" if measurement_valid else "IMU_DEAD_RECKONING"
+        status_str = "STATIONARY" if self.is_stationary else "MOVING"
 
         return {
             "x": round(pos_x, 3),
@@ -314,6 +426,8 @@ class AdaptiveKalmanPositionEstimator:
             "heading_deg": round(heading_deg, 1),
             "uncertainty_m": round(uncertainty, 2),
             "status": status_str,
+            "is_stationary": self.is_stationary,
+            "accel_variance": round(self.accel_variance, 4),
             "anchor_distances": {k: round(v, 2) for k, v in distances.items()},
             "raw_rssi": {
                 a.get("anchor_id"): a.get("rssi_dbm")
@@ -455,13 +569,11 @@ class ESP32SerialReader:
     def read_telemetry(self) -> Optional[dict]:
         """Returns parsed telemetry dict or None."""
         if self.is_simulating:
-            # Generate continuous simulated walking movement between (1, 0) and (9, 0)
             time.sleep(0.1)
             self._sim_t += 0.1
             true_x = 5.0 + 3.5 * math.cos(0.5 * self._sim_t)
             true_y = 1.0 * math.sin(0.5 * self._sim_t)
 
-            # Synthetic RSSI from Anchor A (0,0) and Anchor B (10,0)
             dA = max(0.2, math.sqrt((true_x - 0.0)**2 + (true_y - 0.0)**2))
             dB = max(0.2, math.sqrt((true_x - 10.0)**2 + (true_y - 0.0)**2))
             rssi_a = int(-45.0 - 10.0 * 2.4 * math.log10(dA / 1.0) + np.random.normal(0, 1.5))
@@ -613,6 +725,10 @@ def main():
                         "uncertainty_m": pos_data["uncertainty_m"]
                     },
                     "status": pos_data["status"],
+                    "motion": {
+                        "is_stationary": pos_data["is_stationary"],
+                        "accel_variance": pos_data["accel_variance"]
+                    },
                     "anchor_distances": pos_data["anchor_distances"],
                     "raw_rssi": pos_data["raw_rssi"],
                     "timestamp_ms": int(now_time * 1000),
@@ -623,7 +739,7 @@ def main():
                 live_path = f"{config['firebase']['live_path']}/{device_id}"
                 fb_ok = firebase.set_data(live_path, firebase_payload)
 
-                # Optionally append to history log (/location_history/{device_id}.json)
+                # Append to history log (/location_history/{device_id}.json)
                 if config["firebase"].get("enable_history_logging", True) and fb_ok:
                     hist_path = f"{config['firebase']['history_path']}/{device_id}"
                     firebase.push_data(hist_path, firebase_payload)
@@ -634,12 +750,14 @@ def main():
             ]) or "Scanning..."
             fb_tag = f"FB: {firebase.last_status}"
 
+            mode_tag = "[IDLE/STATIONARY]" if pos_data["is_stationary"] else "[MOVING]"
+
             sys.stdout.write(
-                f"\r[TRACKER] Pos: (X={pos_data['x']:>5.2f}m, Y={pos_data['y']:>5.2f}m) | "
+                f"\r{mode_tag} Pos: (X={pos_data['x']:>5.2f}m, Y={pos_data['y']:>5.2f}m) | "
                 f"V: {pos_data['speed_mps']:>4.2f}m/s | "
-                f"Unc: +/-{pos_data['uncertainty_m']:>4.2f}m | "
+                f"Var: {pos_data['accel_variance']:>5.3f} | "
                 f"RSSI: [{rssi_summary}] | "
-                f"Status: {pos_data['status']} | {fb_tag}    "
+                f"{fb_tag}    "
             )
             sys.stdout.flush()
 

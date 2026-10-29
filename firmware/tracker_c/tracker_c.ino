@@ -12,8 +12,11 @@
  *   - GND: Common Ground
  *   - AD0: Unconnected (defaults to address 0x68)
  *
- * Protocol: Newline-delimited JSON over USB Serial (115200 baud)
- * Non-blocking asynchronous Wi-Fi scanning prevents blocking the IMU sampling loop.
+ * Features:
+ *   - Boot-time resting bias auto-calibration (50 samples)
+ *   - Stale Wi-Fi RSSI timeout & sentinel tagging (age > 2500ms -> invalid)
+ *   - Non-blocking asynchronous Wi-Fi scanning (10 Hz IMU telemetry loop)
+ *   - Compact NDJSON streaming over USB Serial at 115200 baud
  */
 
 #include <WiFi.h>
@@ -37,6 +40,11 @@ const float ACCEL_SCALE = 9.80665f / 16384.0f;
 // Gyro range +/- 250 deg/s: 131 LSB / (deg/s), convert to rad/s
 const float GYRO_SCALE = (3.14159265f / 180.0f) / 131.0f;
 
+// Resting IMU calibration offsets
+float ax_bias = 0.0f;
+float ay_bias = 0.0f;
+float gz_bias = 0.0f;
+
 // Cached RSSI readings and timestamps
 int rssi_A = SENTINEL_RSSI_MISSING;
 int rssi_B = SENTINEL_RSSI_MISSING;
@@ -50,6 +58,26 @@ const unsigned long TELEMETRY_INTERVAL_MS = 100; // 10 Hz telemetry update rate
 
 // Non-blocking Wi-Fi scan state
 bool scanInProgress = false;
+
+void readRawMPU(int16_t &raw_ax, int16_t &raw_ay, int16_t &raw_az, int16_t &raw_gx, int16_t &raw_gy, int16_t &raw_gz) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B); // Starting at register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 14, true);
+
+  if (Wire.available() >= 14) {
+    raw_ax = (Wire.read() << 8) | Wire.read();
+    raw_ay = (Wire.read() << 8) | Wire.read();
+    raw_az = (Wire.read() << 8) | Wire.read();
+    int16_t raw_temp = (Wire.read() << 8) | Wire.read();
+    raw_gx = (Wire.read() << 8) | Wire.read();
+    raw_gy = (Wire.read() << 8) | Wire.read();
+    raw_gz = (Wire.read() << 8) | Wire.read();
+  } else {
+    raw_ax = raw_ay = raw_gx = raw_gy = raw_gz = 0;
+    raw_az = 16384;
+  }
+}
 
 void setupMPU6050() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000); // 400 kHz fast I2C
@@ -76,6 +104,21 @@ void setupMPU6050() {
     Wire.write(0x1B);
     Wire.write(0x00);
     Wire.endTransmission(true);
+
+    // Initial 50-sample resting calibration
+    float sum_ax = 0, sum_ay = 0, sum_gz = 0;
+    const int calib_count = 50;
+    for (int i = 0; i < calib_count; i++) {
+      int16_t rax, ray, raz, rgx, rgy, rgz;
+      readRawMPU(rax, ray, raz, rgx, rgy, rgz);
+      sum_ax += rax * ACCEL_SCALE;
+      sum_ay += ray * ACCEL_SCALE;
+      sum_gz += rgz * GYRO_SCALE;
+      delay(15);
+    }
+    ax_bias = sum_ax / calib_count;
+    ay_bias = sum_ay / calib_count;
+    gz_bias = sum_gz / calib_count;
   } else {
     mpu_detected = false;
   }
@@ -88,35 +131,28 @@ void readMPU6050(float &ax, float &ay, float &az, float &gx, float &gy, float &g
     return;
   }
 
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x3B); // Starting at register 0x3B (ACCEL_XOUT_H)
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050_ADDR, 14, true);
+  int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
+  readRawMPU(raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz);
 
-  if (Wire.available() >= 14) {
-    int16_t raw_ax = (Wire.read() << 8) | Wire.read();
-    int16_t raw_ay = (Wire.read() << 8) | Wire.read();
-    int16_t raw_az = (Wire.read() << 8) | Wire.read();
-    int16_t raw_temp = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gx = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gy = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gz = (Wire.read() << 8) | Wire.read();
+  ax = (raw_ax * ACCEL_SCALE) - ax_bias;
+  ay = (raw_ay * ACCEL_SCALE) - ay_bias;
+  az = raw_az * ACCEL_SCALE;
 
-    ax = raw_ax * ACCEL_SCALE;
-    ay = raw_ay * ACCEL_SCALE;
-    az = raw_az * ACCEL_SCALE;
+  gx = raw_gx * GYRO_SCALE;
+  gy = raw_gy * GYRO_SCALE;
+  gz = (raw_gz * GYRO_SCALE) - gz_bias;
 
-    gx = raw_gx * GYRO_SCALE;
-    gy = raw_gy * GYRO_SCALE;
-    gz = raw_gz * GYRO_SCALE;
-  }
+  // Micro-deadband for resting noise
+  if (fabs(ax) < 0.04f) ax = 0.0f;
+  if (fabs(ay) < 0.04f) ay = 0.0f;
+  if (fabs(gz) < 0.015f) gz = 0.0f;
 }
 
 void checkWifiScan() {
   if (!scanInProgress) {
     // Initiate non-blocking asynchronous scan
-    // Parameters: async = true, show_hidden = false, passive = false, max_ms_per_chan = 120
-    WiFi.scanNetworks(true, false, false, 120);
+    // Parameters: async = true, show_hidden = false, passive = false, max_ms_per_chan = 100
+    WiFi.scanNetworks(true, false, false, 100);
     scanInProgress = true;
   } else {
     int n = WiFi.scanComplete();
@@ -137,10 +173,14 @@ void checkWifiScan() {
         }
       }
 
-      rssi_A = found_a;
-      rssi_B = found_b;
-      if (found_a != SENTINEL_RSSI_MISSING) rssi_A_time = now;
-      if (found_b != SENTINEL_RSSI_MISSING) rssi_B_time = now;
+      if (found_a != SENTINEL_RSSI_MISSING) {
+        rssi_A = found_a;
+        rssi_A_time = now;
+      }
+      if (found_b != SENTINEL_RSSI_MISSING) {
+        rssi_B = found_b;
+        rssi_B_time = now;
+      }
 
       WiFi.scanDelete(); // Clean up memory
       scanInProgress = false;
@@ -158,6 +198,10 @@ void sendTelemetryJSON(float ax, float ay, float az, float gx, float gy, float g
   unsigned long age_a = (rssi_A != SENTINEL_RSSI_MISSING) ? (now - rssi_A_time) : 9999;
   unsigned long age_b = (rssi_B != SENTINEL_RSSI_MISSING) ? (now - rssi_B_time) : 9999;
 
+  // Enforce staleness timeout: if older than 2500ms, mark as invalid missing reading
+  bool valid_a = (rssi_A != SENTINEL_RSSI_MISSING) && (age_a <= 2500);
+  bool valid_b = (rssi_B != SENTINEL_RSSI_MISSING) && (age_b <= 2500);
+
   // Format compact newline-delimited JSON
   Serial.printf(
     "{\"schema_version\":1,\"type\":\"telemetry\",\"device_id\":\"%s\",\"timestamp_ms\":%lu,"
@@ -173,12 +217,12 @@ void sendTelemetryJSON(float ax, float ay, float az, float gx, float gy, float g
     gx, gy, gz,
     mpu_detected ? "true" : "false",
     ANCHOR_A_SSID,
-    rssi_A,
-    (rssi_A != SENTINEL_RSSI_MISSING) ? "true" : "false",
+    valid_a ? rssi_A : SENTINEL_RSSI_MISSING,
+    valid_a ? "true" : "false",
     age_a,
     ANCHOR_B_SSID,
-    rssi_B,
-    (rssi_B != SENTINEL_RSSI_MISSING) ? "true" : "false",
+    valid_b ? rssi_B : SENTINEL_RSSI_MISSING,
+    valid_b ? "true" : "false",
     age_b,
     mpu_detected ? "true" : "false",
     ESP.getFreeHeap()
